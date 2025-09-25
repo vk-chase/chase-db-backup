@@ -1,5 +1,8 @@
 # 🗄️ Chase DB Backups
-
+--[[
+1- my discord https://discord.gg/9fK6cBByvs
+2- support / edits not guaranteed 
+]]
 This little FiveM resource automatically **backs up your MySQL database** and shoots it into a Discord channel.  
 No more forgetting to dump your DB and crying later. It even deletes the temp `.sql` file so your server doesn’t fill up with junk.
 

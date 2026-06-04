@@ -2,14 +2,12 @@ fx_version 'cerulean'
 games { 'gta5' }
 
 author 'Chase Development'
-description 'Chase DB Backups - Lightweight MySQL to Discord'
-version '1.0.0'
+description 'Chase DB Backup - Dependency-free oxmysql SQL backups to Discord'
+version '1.1.2'
 
-server_script 'index.js'
+server_scripts {
+    '@oxmysql/lib/MySQL.lua',
+    'server/main.lua'
+}
 
-lua54 'yes'
-
---[[
-1- my discord https://discord.gg/9fK6cBByvs
-2- support / edits not guaranteed 
-]]
+dependency 'oxmysql'

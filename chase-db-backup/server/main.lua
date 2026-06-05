@@ -442,7 +442,7 @@ local function dumpTable(file, database, tableInfo, config)
     local tableName = tableInfo.TABLE_NAME or tableInfo.table_name
     if not tableName then return end
 
-    log(('Dumping table: %s'):format(tableName))
+    if getBool('chase_db_console_logs', false) then log(('Dumping table: %s'):format(tableName)) end
 
     file:write('\n-- --------------------------------------------------------\n')
     file:write(('-- Table structure for `%s`\n'):format(tableName))

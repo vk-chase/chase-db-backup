@@ -1,56 +1,86 @@
 local RESOURCE = GetCurrentResourceName()
 local RESOURCE_PATH = GetResourcePath(RESOURCE)
 local SQL_DIR = RESOURCE_PATH .. '/sql'
-local BACKUP_INDEX = SQL_DIR .. '/backup-index.json'
+local BACKUP_INDEX_PATH = SQL_DIR .. '/backup-index.json'
 
 local state = {
     running = false,
-    lastRunKey = nil
+    lastScheduleKey = nil
 }
 
-local function log(msg)
-    print(('[%s] %s'):format(RESOURCE, msg))
+local function log(message)
+    print(('[%s] %s'):format(RESOURCE, tostring(message)))
 end
 
-local function warn(msg)
-    print(('^3[%s] %s^7'):format(RESOURCE, msg))
+local function warn(message)
+    print(('^3[%s] %s^7'):format(RESOURCE, tostring(message)))
 end
 
-local function err(msg)
-    print(('^1[%s] %s^7'):format(RESOURCE, msg))
+local function fail(message)
+    print(('^1[%s] %s^7'):format(RESOURCE, tostring(message)))
 end
 
-local function getBool(name, default)
-    local fallback = default and '1' or '0'
-    local value = tostring(GetConvar(name, fallback)):lower()
-    return value == '1' or value == 'true' or value == 'yes' or value == 'on'
+local function trim(value)
+    return tostring(value or ''):match('^%s*(.-)%s*$') or ''
 end
 
-local function getNumber(name, default)
-    local value = tonumber(GetConvar(name, tostring(default)))
-    if value == nil then return default end
-    return value
+local function getString(name, fallback)
+    local value = GetConvar(name, fallback or '')
+    if value == nil then return fallback or '' end
+    return trim(value)
 end
 
-local function getString(name, default)
-    local value = GetConvar(name, default or '')
-    if value == nil then return default or '' end
-    return value
+local function getBool(name, fallback)
+    local raw = GetConvar(name, fallback and '1' or '0')
+    raw = tostring(raw or ''):lower():gsub('%s+', '')
+
+    if raw == '1' or raw == 'true' or raw == 'yes' or raw == 'on' then return true end
+    if raw == '0' or raw == 'false' or raw == 'no' or raw == 'off' then return false end
+
+    return fallback == true
 end
 
-local function parseNumberList(raw)
-    raw = tostring(raw or 'all'):lower():gsub('%s+', '')
-    if raw == '' or raw == 'all' or raw == '*' then return 'all' end
-
-    local list = {}
-    for part in raw:gmatch('[^,]+') do
-        local value = tonumber(part)
-        if value ~= nil then
-            list[#list + 1] = value
+local function getBoolWithAliases(names, fallback)
+    for _, name in ipairs(names) do
+        local raw = GetConvar(name, '')
+        if raw ~= nil and tostring(raw) ~= '' then
+            return getBool(name, fallback)
         end
     end
 
-    return list
+    return fallback == true
+end
+
+local function getNumber(name, fallback)
+    local value = tonumber(GetConvar(name, tostring(fallback)))
+    if value == nil then return fallback end
+    return value
+end
+
+local function parseNumberList(raw, minimum, maximum, fallback)
+    raw = trim(raw or fallback or ''):lower():gsub('%s+', '')
+
+    if raw == '' then
+        raw = trim(fallback or ''):lower():gsub('%s+', '')
+    end
+
+    if raw == 'all' or raw == '*' then
+        return 'all'
+    end
+
+    local output = {}
+    local seen = {}
+
+    for part in raw:gmatch('[^,]+') do
+        local value = tonumber(part)
+        if value and value >= minimum and value <= maximum and not seen[value] then
+            seen[value] = true
+            output[#output + 1] = value
+        end
+    end
+
+    table.sort(output)
+    return output
 end
 
 local function listContains(list, value)
@@ -65,48 +95,66 @@ local function listContains(list, value)
 end
 
 local function loadConfig()
-    local dbName = getString('chase_db_database', '')
-    if dbName == '' then
-        dbName = getString('chase_db_name', '')
+    local database = getString('chase_db_database', '')
+    if database == '' then
+        database = getString('chase_db_name', '')
     end
 
+    local colorRaw = getString('chase_db_color', '0')
+    colorRaw = colorRaw:gsub('#', '')
+
     return {
-        database = dbName,
+        database = database,
         webhook = getString('chase_db_webhook', ''),
-        color = tonumber((getString('chase_db_color', '0'):gsub('#', '')), 16) or 0,
+        username = getString('chase_db_username', 'Chase DB Backup'),
         footer = getString('chase_db_footer', 'Chase DB Backup'),
+        color = tonumber(colorRaw, 16) or 0,
+
         runOnStart = getBool('chase_db_run_on_start', true),
+        startupDelaySeconds = math.max(0, math.floor(getNumber('chase_db_startup_delay', 60))),
+        checkIntervalMs = math.max(5000, math.floor(getNumber('chase_db_check_interval_ms', 15000))),
+
         keepLocal = getBool('chase_db_keep_local', false),
         keepLocalOnFail = getBool('chase_db_keep_local_on_fail', true),
+        maxLocalBackups = math.max(0, math.floor(getNumber('chase_db_max_local_backups', 10))),
+        maxDiscordBytes = math.max(1, math.floor(getNumber('chase_db_max_discord_bytes', 25000000))),
+
         includeDropTable = getBool('chase_db_drop_table', true),
         includeData = getBool('chase_db_include_data', true),
         chunkSize = math.max(50, math.floor(getNumber('chase_db_chunk_size', 500))),
-        checkIntervalMs = math.max(5000, math.floor(getNumber('chase_db_check_interval_ms', 15000))),
-        maxDiscordBytes = math.max(1, math.floor(getNumber('chase_db_max_discord_bytes', 25000000))),
-        maxLocalBackups = math.max(0, math.floor(getNumber('chase_db_max_local_backups', 10))),
-        startupDelaySeconds = math.max(0, math.floor(getNumber('chase_db_startup_delay', 60))),
+        consoleLogs = getBoolWithAliases({ 'chase_db_console_logs', 'zbd_backup_console_logs' }, false),
+
         schedule = {
-            days = parseNumberList(getString('chase_db_days', 'all')),
-            hours = parseNumberList(getString('chase_db_hours', 'all')),
-            minutes = parseNumberList(getString('chase_db_minutes', '0,30'))
+            days = parseNumberList(getString('chase_db_days', 'all'), 1, 31, 'all'),
+            hours = parseNumberList(getString('chase_db_hours', 'all'), 0, 23, 'all'),
+            minutes = parseNumberList(getString('chase_db_minutes', '0,30'), 0, 59, '0,30')
         }
     }
 end
 
-local function escapeIdentifier(value)
-    value = tostring(value or '')
-    return '`' .. value:gsub('`', '``') .. '`'
+local function verbose(config, message)
+    if config and config.consoleLogs then
+        log(message)
+    end
+end
+
+local function quoteIdentifier(value)
+    return '`' .. tostring(value or ''):gsub('`', '``') .. '`'
+end
+
+local function quoteQualified(database, tableName)
+    return quoteIdentifier(database) .. '.' .. quoteIdentifier(tableName)
 end
 
 local function escapeSqlString(value)
-    local s = tostring(value)
-    s = s:gsub('\\', '\\\\')
-    s = s:gsub('\0', '\\0')
-    s = s:gsub('\n', '\\n')
-    s = s:gsub('\r', '\\r')
-    s = s:gsub('\026', '\\Z')
-    s = s:gsub("'", "''")
-    return "'" .. s .. "'"
+    local output = tostring(value)
+    output = output:gsub('\\', '\\\\')
+    output = output:gsub('\0', '\\0')
+    output = output:gsub('\n', '\\n')
+    output = output:gsub('\r', '\\r')
+    output = output:gsub('\026', '\\Z')
+    output = output:gsub("'", "''")
+    return "'" .. output .. "'"
 end
 
 local function sqlValue(value)
@@ -117,11 +165,18 @@ local function sqlValue(value)
     end
 
     if valueType == 'number' then
+        if value ~= value or value == math.huge or value == -math.huge then
+            return 'NULL'
+        end
         return tostring(value)
     end
 
     if valueType == 'boolean' then
         return value and '1' or '0'
+    end
+
+    if valueType == 'table' then
+        return escapeSqlString(json.encode(value))
     end
 
     return escapeSqlString(value)
@@ -135,23 +190,38 @@ local function formatRunKey(t)
     return ('%04d-%02d-%02d_%02d-%02d'):format(t.year, t.month, t.day, t.hour, t.min)
 end
 
-local function getFileNameOnly(path)
-    return tostring(path):match('([^/\\]+)$') or tostring(path)
+local function fileExists(path)
+    local file = io.open(path, 'rb')
+    if not file then return false end
+    file:close()
+    return true
 end
 
 local function fileSize(path)
     local file = io.open(path, 'rb')
     if not file then return 0 end
-
     local size = file:seek('end') or 0
     file:close()
     return size
 end
 
-local function fileExists(path)
+local function readFile(path)
     local file = io.open(path, 'rb')
-    if not file then return false end
+    if not file then return nil end
+    local data = file:read('*a')
     file:close()
+    return data
+end
+
+local function safeRemove(path)
+    if not path or path == '' then return false end
+
+    local ok, removeErr = os.remove(path)
+    if not ok and removeErr then
+        warn(('Could not remove `%s`: %s'):format(path, removeErr))
+        return false
+    end
+
     return true
 end
 
@@ -173,28 +243,13 @@ local function formatBytes(bytes)
     return ('%d bytes'):format(bytes)
 end
 
-local function safeRemove(path)
-    if not path or path == '' then return false end
-    local ok, removeErr = os.remove(path)
-    if not ok and removeErr then
-        warn(('Could not remove %s: %s'):format(path, removeErr))
-        return false
-    end
-    return true
-end
-
 local function loadBackupIndex()
-    local file = io.open(BACKUP_INDEX, 'rb')
-    if not file then return {} end
-
-    local raw = file:read('*a')
-    file:close()
-
+    local raw = readFile(BACKUP_INDEX_PATH)
     if not raw or raw == '' then return {} end
 
     local ok, decoded = pcall(json.decode, raw)
     if not ok or type(decoded) ~= 'table' then
-        warn('backup-index.json is invalid. Rebuilding index from new backups only.')
+        warn('backup-index.json is invalid. A clean index will be written on the next kept local backup.')
         return {}
     end
 
@@ -202,14 +257,15 @@ local function loadBackupIndex()
 end
 
 local function saveBackupIndex(index)
-    local file = io.open(BACKUP_INDEX, 'wb')
+    local file = io.open(BACKUP_INDEX_PATH, 'wb')
     if not file then
-        warn('Could not write backup-index.json.')
-        return
+        warn(('Could not write backup index. Make sure `%s` exists and is writable.'):format(SQL_DIR))
+        return false
     end
 
-    file:write(json.encode(index))
+    file:write(json.encode(index or {}))
     file:close()
+    return true
 end
 
 local function trimBackupIndex(index)
@@ -217,7 +273,7 @@ local function trimBackupIndex(index)
     local seen = {}
 
     for _, entry in ipairs(index or {}) do
-        if type(entry) == 'table' and entry.path and not seen[entry.path] and fileExists(entry.path) then
+        if type(entry) == 'table' and entry.path and fileExists(entry.path) and not seen[entry.path] then
             seen[entry.path] = true
             kept[#kept + 1] = entry
         end
@@ -268,32 +324,22 @@ local function pruneLocalBackups(config)
         local entry = table.remove(index, 1)
         if entry and entry.path and safeRemove(entry.path) then
             removed = removed + 1
-            log(('Removed old local backup: %s'):format(entry.filename or getFileNameOnly(entry.path)))
         end
     end
 
     saveBackupIndex(index)
 
     if removed > 0 then
-        log(('Local backup rotation complete. Removed %s old backup(s). Limit: %s.'):format(removed, maxBackups))
+        log(('Local backup rotation removed %s old backup(s). Limit: %s.'):format(removed, maxBackups))
     end
 end
 
-local function readFile(path)
-    local file = io.open(path, 'rb')
-    if not file then return nil end
-
-    local data = file:read('*a')
-    file:close()
-    return data
-end
-
-local function request(url, method, body, headers)
+local function httpRequest(url, method, body, headers)
     local p = promise.new()
 
     PerformHttpRequest(url, function(statusCode, responseBody, responseHeaders)
         p:resolve({
-            status = statusCode or 0,
+            status = tonumber(statusCode) or 0,
             body = responseBody or '',
             headers = responseHeaders or {}
         })
@@ -302,10 +348,14 @@ local function request(url, method, body, headers)
     return Citizen.Await(p)
 end
 
-local function discordJson(webhook, payload)
-    if webhook == '' then return false, 'Webhook convar is empty.' end
+local function sendDiscordJson(config, payload)
+    if not config.webhook or config.webhook == '' then
+        return false, 'Webhook convar is empty.'
+    end
 
-    local response = request(webhook, 'POST', json.encode(payload), {
+    payload.username = payload.username or config.username
+
+    local response = httpRequest(config.webhook, 'POST', json.encode(payload), {
         ['Content-Type'] = 'application/json'
     })
 
@@ -316,23 +366,26 @@ local function discordJson(webhook, payload)
     return false, ('Discord JSON request failed with HTTP %s: %s'):format(response.status, response.body)
 end
 
-local function discordFile(webhook, filePath, fileName, content, color, footer)
-    if webhook == '' then return false, 'Webhook convar is empty.' end
+local function sendDiscordFile(config, filePath, fileName, content)
+    if not config.webhook or config.webhook == '' then
+        return false, 'missing webhook'
+    end
 
     local data = readFile(filePath)
     if not data then
-        return false, 'Could not read SQL file for Discord upload.'
+        return false, 'could not read SQL file for upload'
     end
 
     local boundary = ('----ChaseDbBackup%s%s'):format(os.time(), math.random(100000, 999999))
     local payload = json.encode({
+        username = config.username,
         content = content or '',
         embeds = {
             {
                 title = 'Database Backup Complete',
                 description = ('Attached file: `%s`'):format(fileName),
-                color = color or 0,
-                footer = { text = footer or 'Chase DB Backup' }
+                color = config.color,
+                footer = { text = config.footer }
             }
         }
     })
@@ -352,7 +405,7 @@ local function discordFile(webhook, filePath, fileName, content, color, footer)
         ''
     }, '\r\n')
 
-    local response = request(webhook, 'POST', body, {
+    local response = httpRequest(config.webhook, 'POST', body, {
         ['Content-Type'] = 'multipart/form-data; boundary=' .. boundary
     })
 
@@ -364,25 +417,21 @@ local function discordFile(webhook, filePath, fileName, content, color, footer)
 end
 
 local function getActiveDatabase(config)
-    if config.database ~= '' then
+    if config.database and config.database ~= '' then
         return config.database
     end
 
-    local db = MySQL.scalar.await('SELECT DATABASE()')
-    if not db or db == '' then
-        error('Unable to detect active database. Set chase_db_database or chase_db_name in server.cfg.')
+    local database = MySQL.scalar.await('SELECT DATABASE()')
+    if not database or database == '' then
+        error('Unable to detect active database. Set chase_db_name "zombodia" in server.cfg.')
     end
 
-    return db
-end
-
-local function escapeQualified(database, tableName)
-    return escapeIdentifier(database) .. '.' .. escapeIdentifier(tableName)
+    return tostring(database)
 end
 
 local function getCreateStatement(database, tableName)
-    local result = MySQL.query.await(('SHOW CREATE TABLE %s'):format(escapeQualified(database, tableName)))
-    local row = result and result[1]
+    local rows = MySQL.query.await(('SHOW CREATE TABLE %s'):format(quoteQualified(database, tableName))) or {}
+    local row = rows[1]
     if not row then return nil end
 
     for key, value in pairs(row) do
@@ -394,17 +443,44 @@ local function getCreateStatement(database, tableName)
     return nil
 end
 
+local function getTables(database)
+    local rows = MySQL.query.await([[
+        SELECT TABLE_NAME, TABLE_TYPE
+        FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
+        ORDER BY TABLE_NAME
+    ]], { database }) or {}
+
+    local tables = {}
+
+    for _, row in ipairs(rows) do
+        local name = row.TABLE_NAME or row.table_name
+        if name and name ~= '' then
+            tables[#tables + 1] = tostring(name)
+        end
+    end
+
+    table.sort(tables)
+    return tables
+end
+
 local function getColumns(database, tableName)
-    local rows = MySQL.query.await([[ 
+    local rows = MySQL.query.await([[
         SELECT COLUMN_NAME
         FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+        WHERE TABLE_SCHEMA = ?
+          AND TABLE_NAME = ?
+          AND (EXTRA IS NULL OR EXTRA NOT LIKE '%GENERATED%')
         ORDER BY ORDINAL_POSITION
     ]], { database, tableName }) or {}
 
     local columns = {}
+
     for _, row in ipairs(rows) do
-        columns[#columns + 1] = row.COLUMN_NAME or row.column_name
+        local name = row.COLUMN_NAME or row.column_name
+        if name and name ~= '' then
+            columns[#columns + 1] = tostring(name)
+        end
     end
 
     return columns
@@ -413,12 +489,12 @@ end
 local function writeInsertRows(file, tableName, columns, rows)
     if #rows == 0 or #columns == 0 then return end
 
-    local columnSql = {}
-    for i = 1, #columns do
-        columnSql[i] = escapeIdentifier(columns[i])
+    local escapedColumns = {}
+    for index, columnName in ipairs(columns) do
+        escapedColumns[index] = quoteIdentifier(columnName)
     end
 
-    file:write(('INSERT INTO %s (%s) VALUES\n'):format(escapeIdentifier(tableName), table.concat(columnSql, ', ')))
+    file:write(('INSERT INTO %s (%s) VALUES\n'):format(quoteIdentifier(tableName), table.concat(escapedColumns, ', ')))
 
     for rowIndex, row in ipairs(rows) do
         local values = {}
@@ -428,6 +504,7 @@ local function writeInsertRows(file, tableName, columns, rows)
         end
 
         file:write('(' .. table.concat(values, ', ') .. ')')
+
         if rowIndex < #rows then
             file:write(',\n')
         else
@@ -438,65 +515,52 @@ local function writeInsertRows(file, tableName, columns, rows)
     file:write('\n')
 end
 
-local function dumpTable(file, database, tableInfo, config)
-    local tableName = tableInfo.TABLE_NAME or tableInfo.table_name
-    if not tableName then return end
-
-    if getBool('chase_db_console_logs', false) then log(('Dumping table: %s'):format(tableName)) end
+local function dumpTable(file, database, tableName, config)
+    verbose(config, ('Dumping table `%s`.'):format(tableName))
 
     file:write('\n-- --------------------------------------------------------\n')
     file:write(('-- Table structure for `%s`\n'):format(tableName))
     file:write('-- --------------------------------------------------------\n\n')
 
     if config.includeDropTable then
-        file:write(('DROP TABLE IF EXISTS %s;\n'):format(escapeIdentifier(tableName)))
+        file:write(('DROP TABLE IF EXISTS %s;\n'):format(quoteIdentifier(tableName)))
     end
 
     local createStatement = getCreateStatement(database, tableName)
     if createStatement then
         file:write(createStatement .. ';\n\n')
     else
-        warn(('Could not read CREATE TABLE statement for %s.'):format(tableName))
+        warn(('Could not read CREATE TABLE statement for `%s`.'):format(tableName))
     end
 
     if not config.includeData then return end
 
-    local countRow = MySQL.single.await(('SELECT COUNT(*) AS row_count FROM %s'):format(escapeQualified(database, tableName)))
-    local rowCount = tonumber(countRow and (countRow.row_count or countRow.count or countRow['COUNT(*)'])) or 0
+    local countRow = MySQL.single.await(('SELECT COUNT(*) AS row_count FROM %s'):format(quoteQualified(database, tableName)))
+    local rowCount = tonumber(countRow and (countRow.row_count or countRow.ROW_COUNT or countRow['COUNT(*)'])) or 0
 
-    if rowCount <= 0 then
+    if rowCount <= 0 then return end
+
+    local columns = getColumns(database, tableName)
+    if #columns == 0 then
+        warn(('Could not read column list for `%s`. Table data skipped.'):format(tableName))
         return
     end
 
     file:write(('-- Data for `%s` (%s rows)\n\n'):format(tableName, rowCount))
 
-    local columns = getColumns(database, tableName)
-    if #columns == 0 then
-        warn(('Could not read column list for %s. Data skipped.'):format(tableName))
-        return
-    end
-
     local offset = 0
-    while offset < rowCount do
-        local rows = MySQL.query.await(('SELECT * FROM %s LIMIT ? OFFSET ?'):format(escapeQualified(database, tableName)), {
-            config.chunkSize,
-            offset
-        }) or {}
+    local chunkSize = math.max(50, tonumber(config.chunkSize) or 500)
 
-        if #rows == 0 then
-            break
-        end
+    while offset < rowCount do
+        local sql = ('SELECT * FROM %s LIMIT %d OFFSET %d'):format(quoteQualified(database, tableName), chunkSize, offset)
+        local rows = MySQL.query.await(sql) or {}
+
+        if #rows == 0 then break end
 
         writeInsertRows(file, tableName, columns, rows)
         offset = offset + #rows
         Wait(0)
     end
-end
-
-local function shouldRun(config, now)
-    return listContains(config.schedule.days, now.day)
-        and listContains(config.schedule.hours, now.hour)
-        and listContains(config.schedule.minutes, now.min)
 end
 
 local function buildBackup(config)
@@ -507,30 +571,27 @@ local function buildBackup(config)
 
     local file = io.open(filePath, 'wb')
     if not file then
-        error(('Could not open backup file for writing: %s'):format(filePath))
+        error(('Could not write backup file. Make sure this folder exists and is writable: %s'):format(SQL_DIR))
     end
 
     file:write('-- Chase DB Backup\n')
+    file:write(('-- Resource: %s\n'):format(RESOURCE))
     file:write(('-- Database: %s\n'):format(database))
-    file:write(('-- Created: %04d-%02d-%02d %02d:%02d:%02d\n\n'):format(now.year, now.month, now.day, now.hour, now.min, now.sec))
+    file:write(('-- Created: %04d-%02d-%02d %02d:%02d:%02d server time\n\n'):format(now.year, now.month, now.day, now.hour, now.min, now.sec))
     file:write('SET FOREIGN_KEY_CHECKS=0;\n')
-    file:write(('CREATE DATABASE IF NOT EXISTS %s;\n'):format(escapeIdentifier(database)))
-    file:write(('USE %s;\n\n'):format(escapeIdentifier(database)))
+    file:write('SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";\n')
+    file:write(('CREATE DATABASE IF NOT EXISTS %s;\n'):format(quoteIdentifier(database)))
+    file:write(('USE %s;\n\n'):format(quoteIdentifier(database)))
 
-    local tables = MySQL.query.await([[ 
-        SELECT TABLE_NAME, TABLE_TYPE
-        FROM information_schema.TABLES
-        WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
-        ORDER BY TABLE_NAME
-    ]], { database }) or {}
-
+    local tables = getTables(database)
     if #tables == 0 then
         file:close()
+        safeRemove(filePath)
         error(('No base tables found for database `%s`.'):format(database))
     end
 
-    for _, tableInfo in ipairs(tables) do
-        dumpTable(file, database, tableInfo, config)
+    for _, tableName in ipairs(tables) do
+        dumpTable(file, database, tableName, config)
     end
 
     file:write('SET FOREIGN_KEY_CHECKS=1;\n')
@@ -539,23 +600,25 @@ local function buildBackup(config)
     return filePath, filename, database, #tables
 end
 
-local function sendBackup(config, filePath, filename, database, tableCount)
+local function uploadBackup(config, filePath, filename, database, tableCount)
     if config.webhook == '' then
-        warn('chase_db_webhook is empty. Backup saved locally only.')
         return false, 'missing webhook'
     end
 
     local size = fileSize(filePath)
+
     if size > config.maxDiscordBytes then
-        local ok, messageErr = discordJson(config.webhook, {
+        local ok, messageErr = sendDiscordJson(config, {
             embeds = {
                 {
                     title = 'Database Backup Saved Locally',
                     description = table.concat({
-                        ('`%s` was created, but it is larger than the configured Discord upload limit.'):format(filename),
+                        ('`%s` was created but was not uploaded because it is larger than the configured Discord limit.'):format(filename),
+                        ('Database: `%s`'):format(database),
+                        ('Tables: `%s`'):format(tableCount),
                         ('Size: `%s`'):format(formatBytes(size)),
                         ('Limit: `%s`'):format(formatBytes(config.maxDiscordBytes)),
-                        'The local SQL file was kept on the server.'
+                        'The SQL file was kept locally on the server.'
                     }, '\n'),
                     color = config.color,
                     footer = { text = config.footer }
@@ -563,65 +626,89 @@ local function sendBackup(config, filePath, filename, database, tableCount)
             }
         })
 
-        if not ok then warn(messageErr) end
+        if not ok then
+            warn(messageErr)
+        end
+
         return false, 'file too large for Discord'
     end
 
     local content = ('Database `%s` backed up. Tables: `%s`. Size: `%s`.'):format(database, tableCount, formatBytes(size))
-    return discordFile(config.webhook, filePath, filename, content, config.color, config.footer)
+    return sendDiscordFile(config, filePath, filename, content)
+end
+
+local function shouldKeepLocal(uploaded, uploadErr, config)
+    if uploaded then
+        return config.keepLocal == true
+    end
+
+    if uploadErr == 'missing webhook' then return true end
+    if uploadErr == 'file too large for Discord' then return true end
+
+    return config.keepLocal == true or config.keepLocalOnFail == true
 end
 
 local function runBackup(reason)
     if state.running then
         warn(('Backup skipped%s. Previous backup is still running.'):format(reason and (' (' .. reason .. ')') or ''))
-        return
+        return false
     end
 
     state.running = true
 
-    local ok, resultOrErr = pcall(function()
+    local ok, errText = pcall(function()
         local config = loadConfig()
+        local started = os.time()
+
+        log(('Starting database backup%s.'):format(reason and (' (' .. reason .. ')') or ''))
+
         local filePath, filename, database, tableCount = buildBackup(config)
-        local uploaded, uploadErr = sendBackup(config, filePath, filename, database, tableCount)
+        local backupSize = fileSize(filePath)
+        local uploaded, uploadErr = uploadBackup(config, filePath, filename, database, tableCount)
+        local keepLocal = shouldKeepLocal(uploaded, uploadErr, config)
 
-        local keepFile = false
-
-        if uploaded then
-            log(('Backup complete and uploaded: %s'):format(filename))
-            keepFile = config.keepLocal
-        else
-            warn(('Backup created but not uploaded: %s (%s)'):format(filename, uploadErr or 'unknown upload error'))
-            keepFile = config.keepLocal or config.keepLocalOnFail or uploadErr == 'file too large for Discord'
-        end
-
-        if keepFile then
+        if keepLocal then
             rememberLocalBackup(filePath, filename, database)
             pruneLocalBackups(config)
         else
             safeRemove(filePath)
             forgetLocalBackup(filePath)
         end
+
+        local elapsed = os.time() - started
+
+        if uploaded then
+            log(('Backup complete and uploaded: %s (%s, %ss)'):format(filename, formatBytes(backupSize), elapsed))
+        else
+            warn(('Backup created but not uploaded: %s (%s, %s, %ss)'):format(filename, uploadErr or 'unknown upload error', formatBytes(backupSize), elapsed))
+        end
     end)
 
     if not ok then
-        err(('Backup failed: %s'):format(resultOrErr))
+        fail(('Backup failed: %s'):format(errText))
     end
 
     state.running = false
+    return ok
+end
+
+local function shouldRunNow(config, now)
+    return listContains(config.schedule.days, now.day)
+        and listContains(config.schedule.hours, now.hour)
+        and listContains(config.schedule.minutes, now.min)
 end
 
 local function schedulerLoop()
-    local config = loadConfig()
-
     while true do
+        local config = loadConfig()
         Wait(config.checkIntervalMs)
-        config = loadConfig()
 
         local now = os.date('*t')
-        if shouldRun(config, now) then
+        if shouldRunNow(config, now) then
             local runKey = formatRunKey(now)
-            if state.lastRunKey ~= runKey then
-                state.lastRunKey = runKey
+
+            if state.lastScheduleKey ~= runKey then
+                state.lastScheduleKey = runKey
                 runBackup('scheduled')
             end
         end
@@ -632,12 +719,21 @@ CreateThread(function()
     Wait(3000)
 
     local config = loadConfig()
+
+    log(('Loaded. Database convar: `%s`. Schedule days=`%s`, hours=`%s`, minutes=`%s`.'):format(
+        config.database ~= '' and config.database or 'auto-detect',
+        type(config.schedule.days) == 'table' and table.concat(config.schedule.days, ',') or 'all',
+        type(config.schedule.hours) == 'table' and table.concat(config.schedule.hours, ',') or 'all',
+        type(config.schedule.minutes) == 'table' and table.concat(config.schedule.minutes, ',') or 'all'
+    ))
+
     if config.runOnStart then
         if config.startupDelaySeconds > 0 then
-            log(('Startup backup scheduled in %s second(s).'):format(config.startupDelaySeconds))
+            log(('Startup backup will run after %s second(s).'):format(config.startupDelaySeconds))
             Wait(config.startupDelaySeconds * 1000)
         end
 
+        state.lastScheduleKey = formatRunKey(os.date('*t'))
         runBackup('startup')
     end
 
@@ -646,11 +742,33 @@ end)
 
 RegisterCommand('chasebackup', function(source)
     if source ~= 0 then
-        warn('chasebackup can only be run from server console.')
+        warn('chasebackup can only be run from the server console.')
         return
     end
 
     CreateThread(function()
         runBackup('manual')
     end)
+end, false)
+
+RegisterCommand('chasebackupstatus', function(source)
+    if source ~= 0 then
+        warn('chasebackupstatus can only be run from the server console.')
+        return
+    end
+
+    local config = loadConfig()
+    local status = state.running and 'running' or 'idle'
+    local webhookStatus = config.webhook ~= '' and 'set' or 'missing'
+
+    log(('Status: %s | database=%s | webhook=%s | run_on_start=%s | keep_local=%s | keep_local_on_fail=%s | max_local=%s | max_discord=%s'):format(
+        status,
+        config.database ~= '' and config.database or 'auto-detect',
+        webhookStatus,
+        tostring(config.runOnStart),
+        tostring(config.keepLocal),
+        tostring(config.keepLocalOnFail),
+        tostring(config.maxLocalBackups),
+        formatBytes(config.maxDiscordBytes)
+    ))
 end, false)
